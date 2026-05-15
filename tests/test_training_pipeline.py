@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 
 from variable_misuse_gnn.models.ggnn import GGNNVariableMisuseModel
+from variable_misuse_gnn.evaluation.config import EvaluationConfig
+from variable_misuse_gnn.evaluation.evaluator import run_evaluation
 from variable_misuse_gnn.training.config import TrainingConfig
 from variable_misuse_gnn.training.dataset import GraphShardDataset, collate_graphs
 from variable_misuse_gnn.training.losses import compute_variable_misuse_loss
@@ -40,8 +42,8 @@ def make_training_graph(graph_id: str, has_bug: bool) -> dict:
 
 
 def write_graph_shards(root: Path) -> None:
-    """Ghi graph shard train/dev nhỏ."""
-    for split in ("train", "dev"):
+    """Ghi graph shard train/dev/eval nhỏ."""
+    for split in ("train", "dev", "eval"):
         split_dir = root / "ast_only" / split
         split_dir.mkdir(parents=True, exist_ok=True)
         with (split_dir / "shard_00000.jsonl").open("w", encoding="utf-8") as file:
@@ -184,6 +186,51 @@ class TrainingPipelineTest(unittest.TestCase):
             report = run_training(resume_config)
 
             self.assertEqual(report["history"][-1]["epoch"], 2)
+
+    def test_run_evaluation_loads_checkpoint_and_writes_metrics(self) -> None:
+        """Evaluator load best checkpoint và ghi metric trên split eval."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_root = root / "graphs"
+            embedding_root = root / "embedding"
+            training_output_root = root / "training_output"
+            evaluation_output_root = root / "evaluation_output"
+            write_graph_shards(graph_root)
+            write_embedding_artifacts(embedding_root)
+
+            training_config = TrainingConfig(
+                graph_root=graph_root,
+                embedding_root=embedding_root,
+                output_root=training_output_root,
+                graph_variant="ast_only",
+                batch_size=2,
+                epochs=1,
+                hidden_dim=16,
+                message_passing_steps=1,
+                dropout=0.0,
+                max_train_graphs=2,
+                max_dev_graphs=2,
+                log_every=0,
+            )
+            run_training(training_config)
+
+            evaluation_config = EvaluationConfig(
+                graph_root=graph_root,
+                embedding_root=embedding_root,
+                checkpoint_path=training_output_root / "best_model.pt",
+                output_root=evaluation_output_root,
+                graph_variant="ast_only",
+                batch_size=2,
+                max_graphs=2,
+                log_every=0,
+            )
+            report = run_evaluation(evaluation_config)
+
+            self.assertTrue((evaluation_output_root / "eval_metrics.json").exists())
+            self.assertEqual(report["split"], "eval")
+            self.assertIn("localization_accuracy", report["metrics"])
+            self.assertIn("repair_accuracy", report["metrics"])
+            self.assertEqual(report["metrics"]["localization_total"], 2)
 
 
 if __name__ == "__main__":
