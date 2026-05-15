@@ -30,4 +30,10 @@ class TrainingConfig:
     freeze_embedding: bool = False
     num_edge_types: int = 12
     checkpoint_name: str = "best_model.pt"
-
+    last_checkpoint_name: str = "last_model.pt"
+    resume_from_checkpoint: Path | None = None
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 1e-4
+    monitor_metric: str = "combined"
+    lr_scheduler_patience: int = 2
+    lr_scheduler_factor: float = 0.5

@@ -136,9 +136,55 @@ class TrainingPipelineTest(unittest.TestCase):
 
             self.assertEqual(len(report["history"]), 1)
             self.assertTrue((output_root / "best_model.pt").exists())
+            self.assertTrue((output_root / "last_model.pt").exists())
             self.assertTrue((output_root / "metrics_history.json").exists())
+            self.assertIn("best_monitor_score", report)
+
+    def test_resume_training_from_last_checkpoint(self) -> None:
+        """Trainer có thể chạy tiếp từ last checkpoint."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            graph_root = root / "graphs"
+            embedding_root = root / "embedding"
+            output_root = root / "output"
+            write_graph_shards(graph_root)
+            write_embedding_artifacts(embedding_root)
+
+            first_config = TrainingConfig(
+                graph_root=graph_root,
+                embedding_root=embedding_root,
+                output_root=output_root,
+                graph_variant="ast_only",
+                batch_size=2,
+                epochs=1,
+                hidden_dim=16,
+                message_passing_steps=1,
+                dropout=0.0,
+                max_train_graphs=2,
+                max_dev_graphs=2,
+                log_every=0,
+            )
+            run_training(first_config)
+
+            resume_config = TrainingConfig(
+                graph_root=graph_root,
+                embedding_root=embedding_root,
+                output_root=output_root,
+                graph_variant="ast_only",
+                batch_size=2,
+                epochs=2,
+                hidden_dim=16,
+                message_passing_steps=1,
+                dropout=0.0,
+                max_train_graphs=2,
+                max_dev_graphs=2,
+                log_every=0,
+                resume_from_checkpoint=output_root / "last_model.pt",
+            )
+            report = run_training(resume_config)
+
+            self.assertEqual(report["history"][-1]["epoch"], 2)
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -50,6 +50,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--freeze-embedding", action="store_true")
+    parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
+    parser.add_argument(
+        "--monitor-metric",
+        choices=["combined", "repair_accuracy", "localization_accuracy", "loss"],
+        default="combined",
+    )
+    parser.add_argument("--lr-scheduler-patience", type=int, default=2)
+    parser.add_argument("--lr-scheduler-factor", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -74,6 +84,12 @@ def main() -> None:
         log_every=args.log_every,
         seed=args.seed,
         freeze_embedding=args.freeze_embedding,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        monitor_metric=args.monitor_metric,
+        lr_scheduler_patience=args.lr_scheduler_patience,
+        lr_scheduler_factor=args.lr_scheduler_factor,
     )
     report = run_training(config)
     print(json.dumps(report["history"][-1], ensure_ascii=False, indent=2))
@@ -82,4 +98,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

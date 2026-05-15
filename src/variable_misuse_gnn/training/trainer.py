@@ -63,10 +63,28 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min" if config.monitor_metric == "loss" else "max",
+        factor=config.lr_scheduler_factor,
+        patience=config.lr_scheduler_patience,
+    )
 
-    best_dev_repair = -1.0
+    start_epoch = 1
+    best_monitor_score = float("inf") if config.monitor_metric == "loss" else -float("inf")
+    epochs_without_improvement = 0
     history = []
-    for epoch in range(1, config.epochs + 1):
+    if config.resume_from_checkpoint is not None:
+        start_epoch, best_monitor_score, history = load_training_checkpoint(
+            config.resume_from_checkpoint,
+            model,
+            optimizer,
+            device,
+            config.monitor_metric,
+        )
+
+    stopped_early = False
+    for epoch in range(start_epoch, config.epochs + 1):
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -89,20 +107,66 @@ def run_training(config: TrainingConfig) -> dict[str, Any]:
             "epoch": epoch,
             "train": train_metrics,
             "dev": dev_metrics,
+            "learning_rate": optimizer.param_groups[0]["lr"],
         }
         history.append(epoch_report)
         print(json.dumps(epoch_report, ensure_ascii=False, indent=2))
 
-        if dev_metrics["repair_accuracy"] >= best_dev_repair:
-            best_dev_repair = float(dev_metrics["repair_accuracy"])
-            save_checkpoint(config, model, optimizer, epoch, dev_metrics)
+        monitor_score = compute_monitor_score(dev_metrics, config.monitor_metric)
+        scheduler.step(monitor_score)
+        improved = has_improved(
+            monitor_score=monitor_score,
+            best_score=best_monitor_score,
+            monitor_metric=config.monitor_metric,
+            min_delta=config.early_stopping_min_delta,
+        )
+        if improved:
+            best_monitor_score = monitor_score
+            epochs_without_improvement = 0
+            save_checkpoint(
+                config=config,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                dev_metrics=dev_metrics,
+                history=history,
+                checkpoint_name=config.checkpoint_name,
+                best_monitor_score=best_monitor_score,
+            )
+        else:
+            epochs_without_improvement += 1
+
+        save_checkpoint(
+            config=config,
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch,
+            dev_metrics=dev_metrics,
+            history=history,
+            checkpoint_name=config.last_checkpoint_name,
+            best_monitor_score=best_monitor_score,
+        )
 
         write_metrics(config, history)
+        if (
+            config.early_stopping_patience > 0
+            and epochs_without_improvement >= config.early_stopping_patience
+        ):
+            stopped_early = True
+            print(
+                "Early stopping: "
+                f"metric={config.monitor_metric} "
+                f"best={best_monitor_score} "
+                f"patience={config.early_stopping_patience}"
+            )
+            break
 
     report = {
         "config": serialize_config(config),
         "embedding_config": embedding_config,
         "device": str(device),
+        "best_monitor_score": best_monitor_score,
+        "stopped_early": stopped_early,
         "history": history,
     }
     (config.output_root / "training_summary.json").write_text(
@@ -206,19 +270,46 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     dev_metrics: dict[str, float | int],
+    history: list[dict[str, Any]],
+    checkpoint_name: str,
+    best_monitor_score: float,
 ) -> None:
-    """Lưu checkpoint tốt nhất theo dev repair accuracy."""
-    checkpoint_path = config.output_root / config.checkpoint_name
+    """Lưu checkpoint model, optimizer và lịch sử metric."""
+    checkpoint_path = config.output_root / checkpoint_name
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
             "dev_metrics": dev_metrics,
+            "history": history,
+            "best_monitor_score": best_monitor_score,
             "config": serialize_config(config),
         },
         checkpoint_path,
     )
+
+
+def load_training_checkpoint(
+    checkpoint_path: Path,
+    model: GGNNVariableMisuseModel,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    monitor_metric: str,
+) -> tuple[int, float, list[dict[str, Any]]]:
+    """Load checkpoint để resume training sau khi Colab bị ngắt."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_epoch = int(checkpoint["epoch"]) + 1
+    history = list(checkpoint.get("history", []))
+    if "best_monitor_score" in checkpoint:
+        best_monitor_score = float(checkpoint["best_monitor_score"])
+    else:
+        dev_metrics = checkpoint.get("dev_metrics", {})
+        best_monitor_score = compute_monitor_score(dev_metrics, monitor_metric)
+    print(f"Resume checkpoint {checkpoint_path} from epoch {start_epoch}")
+    return start_epoch, best_monitor_score, history
 
 
 def write_metrics(config: TrainingConfig, history: list[dict[str, Any]]) -> None:
@@ -235,3 +326,27 @@ def serialize_config(config: TrainingConfig) -> dict[str, Any]:
             data[key] = value.as_posix()
     return data
 
+
+def compute_monitor_score(dev_metrics: dict[str, float | int], monitor_metric: str) -> float:
+    """Tính score dùng cho checkpoint, scheduler và early stopping."""
+    if monitor_metric == "combined":
+        return float(dev_metrics["localization_accuracy"]) + float(dev_metrics["repair_accuracy"])
+    if monitor_metric == "repair_accuracy":
+        return float(dev_metrics["repair_accuracy"])
+    if monitor_metric == "localization_accuracy":
+        return float(dev_metrics["localization_accuracy"])
+    if monitor_metric == "loss":
+        return float(dev_metrics["loss"])
+    raise ValueError(f"Monitor metric không hỗ trợ: {monitor_metric}")
+
+
+def has_improved(
+    monitor_score: float,
+    best_score: float,
+    monitor_metric: str,
+    min_delta: float,
+) -> bool:
+    """Kiểm tra metric hiện tại có cải thiện đủ so với best score không."""
+    if monitor_metric == "loss":
+        return monitor_score < best_score - min_delta
+    return monitor_score > best_score + min_delta

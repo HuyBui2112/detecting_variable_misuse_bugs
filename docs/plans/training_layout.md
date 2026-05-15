@@ -122,13 +122,15 @@ Mỗi variant ghi vào:
 ```text
 /content/drive/MyDrive/variable_misuse_graph_build/artifacts/training/ggnn_shared_embedding_300000/<variant>/
 ├── best_model.pt
+├── last_model.pt
 ├── metrics_history.json
 └── training_summary.json
 ```
 
 Trong đó:
 
-- `best_model.pt`: checkpoint tốt nhất theo dev Repair Accuracy.
+- `best_model.pt`: checkpoint tốt nhất theo monitor metric trên dev.
+- `last_model.pt`: checkpoint epoch cuối để resume nếu Colab bị ngắt.
 - `metrics_history.json`: loss, Localization Accuracy, Repair Accuracy theo epoch.
 - `training_summary.json`: config, device, embedding config và lịch sử metric.
 
@@ -167,7 +169,7 @@ Vai trò:
 | `training/dataset.py` | Đọc graph shards, map token sang id, collate sparse batch |
 | `training/embedding_artifacts.py` | Load shared vocabulary và embedding init |
 | `training/losses.py` | Localization loss và repair loss |
-| `training/trainer.py` | Train loop, evaluation loop, checkpoint, metrics |
+| `training/trainer.py` | Train loop, evaluation loop, checkpoint, metrics, early stopping, resume |
 | `evaluation/metrics.py` | Tích lũy Localization/Repair Accuracy |
 | `utils/device.py` | Tự chọn GPU nếu có |
 | `utils/seed.py` | Set seed để tái lập |
@@ -233,6 +235,11 @@ batch_size = 8
 learning_rate = 1e-3
 weight_decay = 1e-5
 epochs = 5
+early_stopping_patience = 3
+early_stopping_min_delta = 1e-4
+monitor_metric = combined
+lr_scheduler_patience = 2
+lr_scheduler_factor = 0.5
 ```
 
 ## 9. Localization objective
@@ -317,8 +324,12 @@ Mỗi epoch:
    - tính Localization Accuracy
    - tính Repair Accuracy
 
-3. Save checkpoint nếu dev Repair Accuracy tốt hơn
-4. Ghi metrics_history.json sau mỗi epoch
+3. Tính monitor score trên dev
+4. Save `best_model.pt` nếu monitor score cải thiện
+5. Save `last_model.pt` sau mỗi epoch để resume
+6. Reduce learning rate nếu metric không cải thiện
+7. Early stopping nếu quá số epoch patience
+8. Ghi metrics_history.json sau mỗi epoch
 ```
 
 Optimizer:
@@ -335,7 +346,21 @@ optimizer_state_dict
 epoch
 dev_metrics
 config
+history
+best_monitor_score
 ```
+
+Monitor score mặc định:
+
+```text
+combined = dev.localization_accuracy + dev.repair_accuracy
+```
+
+Lý do:
+
+- Đồ án yêu cầu cả Localization Accuracy và Repair Accuracy.
+- Chỉ repair tốt nhưng localization kém vẫn chưa đủ.
+- Combined score giúp checkpoint/early stopping phản ánh cả hai mục tiêu.
 
 ## 12. Chạy song song 3 Colab account
 
@@ -360,10 +385,12 @@ python scripts/train_gnn.py \
   --embedding-root "$EMBEDDING_ROOT" \
   --output-root "$OUTPUT_ROOT" \
   --graph-variant ast_only \
-  --epochs 5 \
+  --epochs 20 \
   --batch-size 8 \
   --hidden-dim 128 \
-  --message-passing-steps 4
+  --message-passing-steps 4 \
+  --early-stopping-patience 3 \
+  --monitor-metric combined
 ```
 
 Account 2:
@@ -374,10 +401,12 @@ python scripts/train_gnn.py \
   --embedding-root "$EMBEDDING_ROOT" \
   --output-root "$OUTPUT_ROOT" \
   --graph-variant ast_next_token \
-  --epochs 5 \
+  --epochs 20 \
   --batch-size 8 \
   --hidden-dim 128 \
-  --message-passing-steps 4
+  --message-passing-steps 4 \
+  --early-stopping-patience 3 \
+  --monitor-metric combined
 ```
 
 Account 3:
@@ -388,10 +417,12 @@ python scripts/train_gnn.py \
   --embedding-root "$EMBEDDING_ROOT" \
   --output-root "$OUTPUT_ROOT" \
   --graph-variant ast_next_token_data_flow \
-  --epochs 5 \
+  --epochs 20 \
   --batch-size 8 \
   --hidden-dim 128 \
-  --message-passing-steps 4
+  --message-passing-steps 4 \
+  --early-stopping-patience 3 \
+  --monitor-metric combined
 ```
 
 Nếu các account không chung Drive:
@@ -423,6 +454,7 @@ python scripts/train_gnn.py \
 
 ```text
 best_model.pt tồn tại
+last_model.pt tồn tại
 metrics_history.json tồn tại
 training_summary.json tồn tại
 loss hữu hạn
@@ -457,7 +489,7 @@ Cách diễn giải:
 - Chưa dùng syntax node hoặc symbol node riêng vì compact GREAT output không giữ metadata đó.
 - Repair loss dùng target đầu tiên nếu có nhiều repair targets.
 - Chưa có batching tối ưu theo số node/edge, nên Colab có thể cần giảm batch size.
-- Chưa có early stopping nâng cao ngoài checkpoint theo dev Repair Accuracy.
+- Early stopping hiện dùng monitor score đơn giản, chưa có phân tích thống kê nâng cao.
 
 ## 16. Điều chỉnh khi Colab thiếu tài nguyên
 
@@ -472,7 +504,7 @@ message_passing_steps: 4 -> 2
 Nếu train quá lâu:
 
 ```text
-epochs: 5 -> 3
+giữ epochs cao nhưng để early stopping tự dừng
 max_train_graphs: dùng subset nhỏ để kiểm tra nhanh
 ```
 
@@ -484,7 +516,32 @@ Nếu muốn so sánh graph structure chặt hơn:
 
 nhưng model có thể kém hơn vì embedding không được fine-tune.
 
-## 17. Definition of Done cho training layer
+## 17. Resume training sau khi Colab bị ngắt
+
+Nếu checkpoint vẫn còn, có thể chạy tiếp từ `last_model.pt`:
+
+```bash
+python scripts/train_gnn.py \
+  --graph-root "$GRAPH_ROOT" \
+  --embedding-root "$EMBEDDING_ROOT" \
+  --output-root "$OUTPUT_ROOT" \
+  --graph-variant ast_next_token_data_flow \
+  --epochs 20 \
+  --batch-size 8 \
+  --hidden-dim 128 \
+  --message-passing-steps 4 \
+  --resume-from-checkpoint "$OUTPUT_ROOT/ast_next_token_data_flow/last_model.pt" \
+  --early-stopping-patience 3 \
+  --monitor-metric combined
+```
+
+Lưu ý:
+
+- `--epochs` là epoch đích cuối cùng, không phải số epoch chạy thêm.
+- Nếu checkpoint chỉ lưu ở runtime tạm `/content`, reset runtime sẽ mất checkpoint.
+- Nếu muốn resume sau reset, cần tải `last_model.pt` về máy hoặc lưu checkpoint lên Drive.
+
+## 18. Definition of Done cho training layer
 
 Training layer được xem là đạt khi:
 
@@ -494,4 +551,3 @@ Training layer được xem là đạt khi:
 - báo cáo được Localization Accuracy và Repair Accuracy;
 - bảng kết quả so sánh AST-only với Data Flow có số liệu thật;
 - không tuyên bố kết quả trên full dataset nếu chỉ train trên balanced subset.
-
